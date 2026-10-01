@@ -1,36 +1,33 @@
 package com.foro.backend;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.foro.backend.dto.CrearForoDTO;
+import com.foro.backend.dto.ForoDTO;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.http.MediaType;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.ActiveProfiles;
-import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 // Test END-TO-END de foros: POST /api/foros y después GET /api/foros.
 //
-// @SpringBootTest levanta el contexto COMPLETO (web + Security + JPA), a
-// diferencia del @WebMvcTest de ForosControllerIntegrationTest, que solo
-// levanta la capa web. Acá el foro se escribe y se lee de verdad en la base.
+// webEnvironment = RANDOM_PORT levanta un servidor Tomcat DE VERDAD en un
+// puerto libre, y TestRestTemplate le pega por HTTP real: socket, serialización
+// de ida y de vuelta, filtros de seguridad, todo. Es un paso más realista que
+// MockMvc, que simula el ciclo de request en memoria sin abrir ningún puerto.
 //
 // @ActiveProfiles("test") hace que se use application-test.properties, o sea
 // H2 en memoria en vez de MySQL. Sin esto el test intentaría conectarse a la
 // base real.
-//
-// @AutoConfigureMockMvc agrega MockMvc al contexto completo, para poder pegarle
-// a los endpoints sin levantar un puerto HTTP real.
 //
 // ⚠️ IMPORTANTE — la base NUNCA arranca vacía:
 // DataSeeder es un CommandLineRunner sin @Profile, así que se ejecuta en
@@ -38,26 +35,25 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 // el @Test. Por eso este test NO afirma cuántos foros hay (nada de hasSize(1)
 // ni count() == 0): busca puntualmente el foro que creó, por id y por nombre.
 //
-// Tampoco se autentica: "/api/foros" está en permitAll() dentro de
+// Tampoco manda credenciales: "/api/foros" está en permitAll() dentro de
 // SecurityConfig, así que tanto el POST como el GET son públicos.
-@SpringBootTest
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
-@AutoConfigureMockMvc
 class ForosE2ETest {
 
+    // TestRestTemplate ya viene apuntado al host y al puerto que eligió el
+    // test, así que las URLs se escriben relativas ("/api/foros").
+    // A diferencia de RestTemplate, no lanza excepción ante un 4xx/5xx:
+    // devuelve el status dentro de la respuesta para poder afirmarlo.
     @Autowired
-    private MockMvc mockMvc;
-
-    // ObjectMapper de Spring Boot: ya viene configurado para LocalDateTime
-    @Autowired
-    private ObjectMapper objectMapper;
+    private TestRestTemplate restTemplate;
 
     @Test
     @DisplayName("E2E: POST /api/foros crea el foro y después aparece en GET /api/foros")
-    void crearForo_yDespuesAparecerEnElListado() throws Exception {
+    void crearForo_yDespuesAparecerEnElListado() {
         // ARRANGE
         // Nombre único por corrida: así el foro no choca con los 6 del
-        // DataSeeder ni con lo que haya dejado otro test en el mismo contexto.
+        // DataSeeder ni con lo que haya dejado otra corrida del test.
         String nombreUnico = "Foro E2E " + UUID.randomUUID();
 
         CrearForoDTO nuevoForo = new CrearForoDTO();
@@ -66,46 +62,70 @@ class ForosE2ETest {
         nuevoForo.setFacultad("general");
 
         // ── PASO 1: POST /api/foros ─────────────────────────────────────────
-        String respuestaPost = mockMvc.perform(post("/api/foros")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(nuevoForo)))
-                // El Controller responde 201 CREATED, no 200
-                .andExpect(status().isCreated())
-                // El id lo generó la BD de verdad (H2), no un mock
-                .andExpect(jsonPath("$.id").isNumber())
-                .andExpect(jsonPath("$.nombre").value(nombreUnico))
-                .andExpect(jsonPath("$.descripcion").value("Foro creado por el test end-to-end."))
-                .andExpect(jsonPath("$.facultad").value("general"))
-                // @CreationTimestamp de BaseEntity completó la fecha al persistir
-                .andExpect(jsonPath("$.createdAt").exists())
-                .andReturn()
-                .getResponse()
-                .getContentAsString();
+        // postForEntity serializa el DTO a JSON, lo manda por HTTP real y
+        // deserializa la respuesta al tipo que le pedimos.
+        ResponseEntity<ForoDTO> respuestaPost =
+                restTemplate.postForEntity("/api/foros", nuevoForo, ForoDTO.class);
 
-        Long idCreado = objectMapper.readTree(respuestaPost).get("id").asLong();
-        assertThat(idCreado).isNotNull().isPositive();
+        // El Controller responde 201 CREATED, no 200
+        assertThat(respuestaPost.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        ForoDTO creado = respuestaPost.getBody();
+        assertThat(creado).isNotNull();
+        // El id lo generó la BD de verdad (H2), no un mock
+        assertThat(creado.getId()).isNotNull().isPositive();
+        assertThat(creado.getNombre()).isEqualTo(nombreUnico);
+        assertThat(creado.getDescripcion()).isEqualTo("Foro creado por el test end-to-end.");
+        assertThat(creado.getFacultad()).isEqualTo("general");
+        // @CreationTimestamp de BaseEntity completó la fecha al persistir
+        assertThat(creado.getCreatedAt()).isNotNull();
+
+        Long idCreado = creado.getId();
 
         // ── PASO 2: GET /api/foros ──────────────────────────────────────────
+        // Pedimos un array porque el endpoint devuelve una lista JSON.
+        ResponseEntity<ForoDTO[]> respuestaGet =
+                restTemplate.getForEntity("/api/foros", ForoDTO[].class);
+
+        assertThat(respuestaGet.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(respuestaGet.getBody()).isNotNull();
+
         // No afirmamos el tamaño de la lista: el DataSeeder ya dejó 6 foros y
         // el total depende de qué otros tests hayan corrido en este contexto.
-        // Filtramos por el id que devolvió el POST.
-        //
-        // El jsonPath "$[?(@.id == N)]" es un filtro: recorre el array y se
-        // queda con los elementos cuyo campo id valga N. Si encuentra
-        // exactamente uno, Spring desenvuelve la lista y compara el valor;
-        // si encuentra cero o más de uno, el test falla.
-        mockMvc.perform(get("/api/foros"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$[?(@.id == " + idCreado + ")].nombre").value(nombreUnico))
-                .andExpect(jsonPath("$[?(@.id == " + idCreado + ")].facultad").value("general"))
-                .andExpect(jsonPath("$[?(@.id == " + idCreado + ")].descripcion")
-                        .value("Foro creado por el test end-to-end."));
+        // Buscamos por el id que devolvió el POST, exigiendo un único match.
+        ForoDTO encontradoPorId = buscarUnico(respuestaGet.getBody(),
+                foro -> idCreado.equals(foro.getId()),
+                "id " + idCreado);
+
+        assertThat(encontradoPorId.getNombre()).isEqualTo(nombreUnico);
+        assertThat(encontradoPorId.getFacultad()).isEqualTo("general");
+        assertThat(encontradoPorId.getDescripcion())
+                .isEqualTo("Foro creado por el test end-to-end.");
 
         // Y el mismo foro también se encuentra buscándolo por nombre,
         // que es la otra forma estable de identificarlo sin contar registros.
-        mockMvc.perform(get("/api/foros"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$[?(@.nombre == '" + nombreUnico + "')].id")
-                        .value(idCreado.intValue()));
+        ForoDTO encontradoPorNombre = buscarUnico(respuestaGet.getBody(),
+                foro -> nombreUnico.equals(foro.getNombre()),
+                "nombre " + nombreUnico);
+
+        assertThat(encontradoPorNombre.getId()).isEqualTo(idCreado);
+    }
+
+    // ── helper ──────────────────────────────────────────────────────────────
+
+    // Devuelve el único foro del array que cumpla el filtro.
+    // Falla con un mensaje claro si no hay ninguno o si hay más de uno: es el
+    // equivalente a lo que hacía el filtro jsonPath "$[?(@.id == N)]".
+    private ForoDTO buscarUnico(ForoDTO[] foros,
+                                Predicate<ForoDTO> filtro,
+                                String descripcionBusqueda) {
+        List<ForoDTO> coincidencias = Arrays.stream(foros).filter(filtro).toList();
+
+        assertThat(coincidencias)
+                .withFailMessage("Se esperaba exactamente 1 foro con %s, pero hubo %d",
+                        descripcionBusqueda, coincidencias.size())
+                .hasSize(1);
+
+        return coincidencias.get(0);
     }
 }
